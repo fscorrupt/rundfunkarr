@@ -108,20 +108,14 @@ export async function getQueue(): Promise<SabnzbdQueue> {
     const remainingBytes = totalSizeNum - downloadedBytesNum;
     const speedMbps = (speedNum / 1024 / 1024).toFixed(1);
 
-    // Calculate time left
-    let timeleft = "";
+    // Calculate time left — must always be H:MM:SS for Sonarr compatibility
+    let timeleft = "0:00:00";
     if (d.status === "downloading" && speedNum > 0) {
       const secondsLeft = Math.round(remainingBytes / speedNum);
       const hours = Math.floor(secondsLeft / 3600);
       const minutes = Math.floor((secondsLeft % 3600) / 60);
       const seconds = secondsLeft % 60;
-      if (hours > 0) {
-        timeleft = `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
-      } else {
-        timeleft = `${minutes}:${seconds.toString().padStart(2, "0")}`;
-      }
-    } else if (d.status === "converting") {
-      timeleft = "Konvertiere...";
+      timeleft = `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
     }
 
     return {
