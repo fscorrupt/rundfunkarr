@@ -33,7 +33,7 @@ Rundfunk-Indexer für Sonarr/Radarr - Automatischer Download von ARD, ZDF und an
 ```yaml
 services:
   rundfunkarr:
-    image: rundfunkarr/rundfunkarr:latest
+    image: ghcr.io/rundfunkarr/rundfunkarr:latest
     container_name: rundfunkarr
     environment:
       - TZ=Europe/Berlin
