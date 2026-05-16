@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useSettings } from "@/contexts/settings-context";
+import { buildTvdbLoginPayload } from "@/lib/tvdb-auth";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
@@ -122,7 +123,8 @@ export default function SettingsPage() {
     try {
       const key = getFieldValue("api.tvdb.key");
       const pin = getFieldValue("api.tvdb.pin");
-      if (!key || !pin) {
+      const payload = buildTvdbLoginPayload(key, pin);
+      if (!payload) {
         setApiStatus((prev) => ({ ...prev, tvdb: false }));
         return;
       }
@@ -130,7 +132,7 @@ export default function SettingsPage() {
       const res = await fetch("https://api4.thetvdb.com/v4/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apikey: key, pin }),
+        body: JSON.stringify(payload),
       });
       setApiStatus((prev) => ({ ...prev, tvdb: res.ok }));
     } catch {
@@ -297,7 +299,8 @@ export default function SettingsPage() {
                 <CardHeader>
                   <CardTitle>TVDB API</CardTitle>
                   <CardDescription>
-                    TheTVDB.com API-Zugangsdaten für Show-Metadaten.{" "}
+                    TheTVDB.com API-Zugangsdaten für Show-Metadaten. Project API Keys funktionieren
+                    ohne PIN; Subscriber-Keys können weiterhin eine PIN verwenden.{" "}
                     <a
                       href="https://thetvdb.com/api-information"
                       target="_blank"
@@ -319,11 +322,11 @@ export default function SettingsPage() {
                     />
                   </div>
                   <div>
-                    <label className="text-sm font-medium">PIN</label>
+                    <label className="text-sm font-medium">PIN (optional)</label>
                     <Input
                       value={getFieldValue("api.tvdb.pin")}
                       onChange={(e) => setFieldValue("api.tvdb.pin", e.target.value)}
-                      placeholder="TVDB PIN"
+                      placeholder="TVDB PIN (optional)"
                       className="mt-1"
                     />
                   </div>

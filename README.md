@@ -124,7 +124,7 @@ RundfunkArr bietet eine vollständige Web-Oberfläche mit:
 RundfunkArr sucht Show-Informationen in folgender Reihenfolge:
 
 1. **Lokale Datenbank** (`data/shows.json`) - Kein API Key nötig
-2. **TVDB** - Wenn in den Einstellungen konfiguriert (kostenpflichtig)
+2. **TVDB** - Wenn in den Einstellungen konfiguriert (Project API Key ohne PIN oder Subscriber-Key mit optionalem PIN)
 3. **TMDB** - Wenn in den Einstellungen konfiguriert (kostenlos)
 
 Für Shows die nicht in TVDB/TMDB sind, können Einträge in `data/shows.json` hinzugefügt werden.
