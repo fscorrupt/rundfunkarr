@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { clearSettingsCache } from "@/lib/settings";
 import { clearTTLCache } from "@/lib/cache";
+import { isTvdbCredentialSettingKey } from "@/lib/tvdb-auth";
+import { clearTvdbTokenCache } from "@/services/tvdb";
 
 // Default settings
 const DEFAULT_SETTINGS: Record<string, string> = {
@@ -66,21 +68,26 @@ export async function POST(request: NextRequest) {
 
     // Handle single key-value pair
     if (body.key && body.value !== undefined) {
+      const key = String(body.key);
       await prisma.config.upsert({
-        where: { key: body.key },
+        where: { key },
         update: { value: String(body.value) },
-        create: { key: body.key, value: String(body.value) },
+        create: { key, value: String(body.value) },
       });
       clearSettingsCache();
+      if (isTvdbCredentialSettingKey(key)) {
+        await clearTvdbTokenCache();
+      }
       // Clear TTL cache if cache settings changed
-      if (body.key.startsWith("cache.")) {
+      if (key.startsWith("cache.")) {
         clearTTLCache();
       }
-      return NextResponse.json({ success: true, key: body.key });
+      return NextResponse.json({ success: true, key });
     }
 
     // Handle multiple settings
     if (typeof body === "object" && !body.key) {
+      const changedKeys = Object.keys(body);
       const updates = Object.entries(body).map(([key, value]) =>
         prisma.config.upsert({
           where: { key },
@@ -90,11 +97,14 @@ export async function POST(request: NextRequest) {
       );
       await Promise.all(updates);
       clearSettingsCache();
+      if (changedKeys.some(isTvdbCredentialSettingKey)) {
+        await clearTvdbTokenCache();
+      }
       // Clear TTL cache if any cache settings changed
-      if (Object.keys(body).some((key) => key.startsWith("cache."))) {
+      if (changedKeys.some((key) => key.startsWith("cache."))) {
         clearTTLCache();
       }
-      return NextResponse.json({ success: true, updated: Object.keys(body).length });
+      return NextResponse.json({ success: true, updated: changedKeys.length });
     }
 
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
@@ -118,6 +128,9 @@ export async function DELETE(request: NextRequest) {
       where: { key },
     });
     clearSettingsCache();
+    if (isTvdbCredentialSettingKey(key)) {
+      await clearTvdbTokenCache();
+    }
     if (key.startsWith("cache.")) {
       clearTTLCache();
     }
@@ -125,6 +138,9 @@ export async function DELETE(request: NextRequest) {
   } catch {
     // Key might not exist, which is fine
     clearSettingsCache();
+    if (isTvdbCredentialSettingKey(key)) {
+      await clearTvdbTokenCache();
+    }
     if (key.startsWith("cache.")) {
       clearTTLCache();
     }
