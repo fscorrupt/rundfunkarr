@@ -12,6 +12,7 @@ import {
 import {
   generateRssItems,
   generateMovieRssItems,
+  generateGenericRssItems,
   convertItemsToRss,
   serializeRss,
   getEmptyRssResult,
@@ -611,6 +612,8 @@ async function applyRulesetFilters(
 
       if (matchInfo) {
         matchedEpisodes.push(matchInfo);
+        const idx = unmatchedItems.indexOf(item);
+        if (idx > -1) unmatchedItems.splice(idx, 1);
         break;
       } else {
         const idx = unmatchedItems.indexOf(item);
@@ -784,17 +787,20 @@ export async function fetchSearchResultsByString(
   limit: number,
   offset: number
 ): Promise<string> {
+  // Normalize once: a whitespace-only q is treated as no query everywhere
+  // (API query, cache keys, and generic gating) so behavior stays consistent.
+  const trimmedQ = q?.trim() || null;
   const quality = await getQualityPreference();
   const minDuration = await getMinDuration();
   const matchingSettings = await getMatchingSettings();
-  const cacheKey = `q_${q ?? "null"}_${season ?? "null"}_${limit}_${offset}_${quality}_${minDuration}_${matchingSettings.threshold}`;
+  const cacheKey = `q_${trimmedQ ?? "null"}_${season ?? "null"}_${limit}_${offset}_${quality}_${minDuration}_${matchingSettings.threshold}`;
 
   const cached = mediathekCache.get(cacheKey);
   if (cached) {
     return (cached as { response: string }).response;
   }
 
-  const apiCacheKey = `mediathekapi_${q ?? "null"}_${season ?? "null"}`;
+  const apiCacheKey = `mediathekapi_${trimmedQ ?? "null"}_${season ?? "null"}`;
   let apiResponse: string;
   const cachedApi = mediathekCache.get(apiCacheKey);
 
@@ -803,8 +809,8 @@ export async function fetchSearchResultsByString(
   } else {
     const queries: Array<{ fields: string[]; query: string }> = [];
 
-    if (q) {
-      queries.push({ fields: QUERY_FIELDS, query: q });
+    if (trimmedQ) {
+      queries.push({ fields: QUERY_FIELDS, query: trimmedQ });
     }
 
     if (season) {
@@ -829,11 +835,22 @@ export async function fetchSearchResultsByString(
     return serializeRss(getEmptyRssResult());
   }
 
-  const { matchedEpisodes } = await applyRulesetFilters(results);
+  const { matchedEpisodes, unmatchedItems } = await applyRulesetFilters(results);
   const newznabItems: NewznabItem[] = matchedEpisodes.flatMap((info) =>
     generateRssItems(info, quality)
   );
-  const response = convertItemsToRss(newznabItems, limit, offset);
+
+  // Generic (no-ruleset) results are only meaningful for an actual text search.
+  // A season-only query (e.g. tvsearch&season=01 with no q) would otherwise emit
+  // every title that merely contains "S01" across unrelated shows. Gate on a
+  // non-empty q to keep the previous (matched-only) behavior for those queries.
+  const hasTextQuery = !!trimmedQ;
+  const genericItems: NewznabItem[] = hasTextQuery
+    ? unmatchedItems.flatMap((item) => generateGenericRssItems(item, quality))
+    : [];
+
+  const allItems = [...newznabItems, ...genericItems];
+  const response = convertItemsToRss(allItems, limit, offset);
 
   mediathekCache.set(cacheKey, { response });
   return response;
