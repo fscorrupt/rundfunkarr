@@ -1,5 +1,7 @@
 import { prisma } from "@/lib/db";
 import { isMkvConversionEnabled } from "@/lib/settings";
+import { downloadHlsStream } from "./ytdlp";
+import { getStreamHeight, isStreamingUrl, srfUrnFromUrl } from "@/lib/stream-url";
 import * as fs from "fs/promises";
 import { createWriteStream } from "fs";
 import * as path from "path";
@@ -104,12 +106,21 @@ async function moveIntoCategoryDir(
   categoryDir: string
 ): Promise<void> {
   await fs.mkdir(categoryDir, { recursive: true });
+  const move = async () => {
+    try {
+      await fs.rename(sourcePath, targetPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+      await fs.copyFile(sourcePath, targetPath);
+      await fs.unlink(sourcePath);
+    }
+  };
   try {
-    await fs.rename(sourcePath, targetPath);
+    await move();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     await fs.mkdir(categoryDir, { recursive: true });
-    await fs.rename(sourcePath, targetPath);
+    await move();
   }
 }
 
@@ -144,6 +155,84 @@ async function processDownload(downloadId: string): Promise<void> {
     await fs.mkdir(downloadTempPath, { recursive: true });
     await fs.mkdir(categoryDir, { recursive: true });
 
+    // Check if this is an HLS stream
+    const isHls = isStreamingUrl(download.url);
+
+    if (isHls) {
+      // HLS download path - use yt-dlp
+      console.log(`[Download] Detected HLS stream, using yt-dlp`);
+
+      // Resolve stable SRF references at download time. The SRGSSR extractor
+      // also obtains Akamai tokens and uses the configured proxy for metadata.
+      const urn = srfUrnFromUrl(download.url);
+      const maxHeight = getStreamHeight(download.url);
+      const streamUrl = urn
+        ? urn.replace(/^urn:/, "srgssr:")
+        : maxHeight
+          ? download.url.split("#")[0]
+          : download.url;
+      const container = (await isMkvConversionEnabled()) ? "mkv" : "mp4";
+      const tempMkvPath = path.join(downloadTempPath, `${download.title}.${container}`);
+      const finalMkvPath = path.join(categoryDir, `${download.title}.${container}`);
+
+      const hlsResult = await downloadHlsStream(
+        streamUrl,
+        tempMkvPath,
+        async (progress, downloadedBytes, totalBytes, speed) => {
+          await prisma.download.update({
+            where: { id: downloadId },
+            data: {
+              progress,
+              downloadedBytes,
+              totalSize: totalBytes,
+              speed,
+            },
+          });
+        },
+        container,
+        maxHeight
+      );
+
+      if (!hlsResult.success) {
+        await markAsFailed(downloadId, hlsResult.error || "HLS download failed");
+        return;
+      }
+
+      // Move to final location
+      const outputPath = hlsResult.outputPath || tempMkvPath;
+      console.log(`[Download] Moving HLS result to final location: ${finalMkvPath}`);
+      await moveIntoCategoryDir(outputPath, finalMkvPath, categoryDir);
+
+      // Get file size
+      const stats = await fs.stat(finalMkvPath);
+
+      // Calculate storage path (may be mapped differently)
+      const downloadFolderMapping = process.env.DOWNLOAD_FOLDER_PATH_MAPPING;
+      const storagePath = downloadFolderMapping
+        ? path.join(downloadFolderMapping, download.category, `${download.title}.${container}`)
+        : finalMkvPath;
+
+      // Mark as completed
+      const downloadTime = Math.floor((Date.now() - startTime) / 1000);
+
+      await prisma.download.update({
+        where: { id: downloadId },
+        data: {
+          status: "completed",
+          progress: 100,
+          size: stats.size,
+          filePath: storagePath,
+          completedAt: new Date(),
+        },
+      });
+
+      console.log(
+        `[Download] HLS completed: ${download.title} (${Math.round(stats.size / 1024 / 1024)}MB in ${downloadTime}s)`
+      );
+      return;
+    }
+
+    // Standard direct download path
     // Determine file extension from URL
     const urlPath = new URL(download.url).pathname;
     const fileExtension = path.extname(urlPath) || ".mp4";
@@ -287,6 +376,16 @@ async function markAsFailed(downloadId: string, error: string): Promise<void> {
   });
 }
 
+// CDN streams (confirmed live: a 3sat direct-download URL) can stop sending
+// data mid-transfer without closing the connection or erroring - fetch()'s
+// reader.read() then just hangs forever, since fetch has no built-in
+// stall/read timeout. That leaves a download stuck at whatever percent it
+// reached, with no error, no retry, and nothing for Radarr/Sonarr to act on
+// even once they can see the queue (see formatSabnzbdTimeleft's doc comment
+// for the separate bug that hid this from them entirely). Abort if no data
+// arrives for this long.
+const STALL_TIMEOUT_MS = 60_000;
+
 async function downloadFile(
   url: string,
   destPath: string,
@@ -297,8 +396,21 @@ async function downloadFile(
     speed: number
   ) => Promise<void>
 ): Promise<boolean> {
+  const abortController = new AbortController();
+  let fileStream: ReturnType<typeof createWriteStream> | undefined;
+  let completed = false;
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
+  const resetStallTimer = () => {
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      console.error(`[Download] No data received for ${STALL_TIMEOUT_MS / 1000}s, aborting`);
+      abortController.abort();
+    }, STALL_TIMEOUT_MS);
+  };
+
   try {
-    const response = await fetch(url);
+    resetStallTimer();
+    const response = await fetch(url, { signal: abortController.signal });
 
     if (!response.ok || !response.body) {
       console.error(`[Download] HTTP error: ${response.status} ${response.statusText}`);
@@ -306,7 +418,8 @@ async function downloadFile(
     }
 
     const contentLength = parseInt(response.headers.get("content-length") || "0", 10);
-    const fileStream = createWriteStream(destPath);
+    fileStream = createWriteStream(destPath);
+    fileStream.on("error", () => abortController.abort());
 
     const reader = response.body.getReader();
     let downloadedBytes = 0;
@@ -317,12 +430,15 @@ async function downloadFile(
 
     while (true) {
       const { done, value } = await reader.read();
+      resetStallTimer();
 
       if (done) {
         break;
       }
 
-      fileStream.write(Buffer.from(value));
+      await new Promise<void>((resolve, reject) => {
+        fileStream!.write(Buffer.from(value), (error) => (error ? reject(error) : resolve()));
+      });
       downloadedBytes += value.length;
 
       // Calculate speed every second
@@ -345,18 +461,31 @@ async function downloadFile(
       }
     }
 
-    fileStream.end();
-
-    return new Promise((resolve) => {
-      fileStream.on("finish", () => resolve(true));
-      fileStream.on("error", (err) => {
+    completed = await new Promise<boolean>((resolve) => {
+      fileStream!.once("finish", () => resolve(true));
+      fileStream!.once("error", (err) => {
         console.error(`[Download] Write error: ${err}`);
         resolve(false);
       });
+      fileStream!.end();
     });
+    return completed;
   } catch (error) {
     console.error(`[Download] Error downloading file:`, error);
     return false;
+  } finally {
+    clearTimeout(stallTimer);
+    if (!completed) {
+      abortController.abort();
+      if (fileStream) {
+        await new Promise<void>((resolve) => {
+          if (fileStream!.closed) return resolve();
+          fileStream!.once("close", resolve);
+          fileStream!.destroy();
+        });
+        await fs.unlink(destPath).catch(() => {});
+      }
+    }
   }
 }
 

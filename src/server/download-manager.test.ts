@@ -19,6 +19,7 @@ const {
   downloadUpdate,
   ffmpegModuleLoaded,
   convertMp4ToMkv,
+  downloadHlsStream,
 } = vi.hoisted(() => ({
   configFindUnique: vi.fn(),
   downloadCount: vi.fn(),
@@ -26,6 +27,7 @@ const {
   downloadUpdate: vi.fn(),
   ffmpegModuleLoaded: vi.fn(),
   convertMp4ToMkv: vi.fn(),
+  downloadHlsStream: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => ({
@@ -44,10 +46,62 @@ vi.mock("./ffmpeg", () => {
   return { convertMp4ToMkv };
 });
 
+vi.mock("./ytdlp", () => ({ downloadHlsStream }));
+
 import { clearSettingsCache } from "@/lib/settings";
 import { processDownload } from "./download-manager";
 
 let testRoot: string;
+
+it.each(["mkv", "mp4"])(
+  "resolves SRF at download time and finishes HLS as %s across mounts",
+  async (container) => {
+    configFindUnique.mockImplementation(({ where }: { where: { key: string } }) =>
+      Promise.resolve(
+        where.key === "download.path"
+          ? { value: testRoot }
+          : where.key === "download.convertToMkv"
+            ? { value: String(container === "mkv") }
+            : null
+      )
+    );
+    downloadFindUnique.mockResolvedValue({
+      id: "hls",
+      title: "Rundschau",
+      category: "tv",
+      status: "queued",
+      url: "https://www.srf.ch/play/tv/redirect/detail/11111111-1111-4111-8111-111111111111#rundfunkarr-height=480",
+    });
+    downloadUpdate.mockResolvedValue({});
+    downloadCount.mockResolvedValue(0);
+    downloadHlsStream.mockImplementation(async (_url: string, output: string) => {
+      await writeFile(output, "media");
+      return { success: true, outputPath: output };
+    });
+    vi.mocked(fsp.rename).mockRejectedValueOnce(
+      Object.assign(new Error("cross-device"), { code: "EXDEV" })
+    );
+    await processDownload("hls");
+    expect(downloadHlsStream).toHaveBeenLastCalledWith(
+      "srgssr:srf:video:11111111-1111-4111-8111-111111111111",
+      expect.stringContaining(`Rundschau.${container}`),
+      expect.any(Function),
+      container,
+      480
+    );
+    expect(await readFile(path.join(testRoot, "tv", `Rundschau.${container}`), "utf8")).toBe(
+      "media"
+    );
+    expect(downloadUpdate).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "completed",
+          filePath: `/mapped/downloads/tv/Rundschau.${container}`,
+        }),
+      })
+    );
+  }
+);
 
 beforeEach(async () => {
   clearSettingsCache();
@@ -261,4 +315,55 @@ describe("processDownload", () => {
       data: expect.objectContaining({ status: "completed" }),
     });
   });
+});
+
+it.each(["network error", "stall"])("removes partial files after a %s", async (failure) => {
+  configFindUnique.mockImplementation(({ where }: { where: { key: string } }) =>
+    Promise.resolve(where.key === "download.path" ? { value: testRoot } : null)
+  );
+  downloadFindUnique.mockResolvedValue({
+    id: "failed-transfer",
+    title: "Partial",
+    category: "tv",
+    status: "queued",
+    url: "https://example.org/video.mp4",
+  });
+  downloadUpdate.mockResolvedValue({});
+  downloadCount.mockResolvedValue(0);
+  let source!: ReadableStreamDefaultController<Uint8Array>;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_url, options) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          source = controller;
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+        },
+      });
+      options.signal.addEventListener("abort", () => source.error(new Error("aborted")), {
+        once: true,
+      });
+      return new Response(body, { headers: { "content-length": "100" } });
+    })
+  );
+  vi.useFakeTimers();
+  try {
+    const done = processDownload("failed-transfer");
+    await vi.waitFor(() =>
+      expect(downloadUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ downloadedBytes: 3 }),
+        })
+      )
+    );
+    if (failure === "stall") await vi.advanceTimersByTimeAsync(60001);
+    else source.error(new Error("connection lost"));
+    await done;
+    await expect(access(path.join(testRoot, "incomplete", "Partial.mp4"))).rejects.toThrow();
+    expect(downloadUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "failed" }) })
+    );
+  } finally {
+    vi.useRealTimers();
+  }
 });

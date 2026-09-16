@@ -39,15 +39,31 @@ FROM node:24-alpine AS runner
 WORKDIR /app
 
 # Install runtime dependencies for FFmpeg, user management, and DB init
+# Note: yt-dlp standalone binary includes bundled Python, no separate install needed
 RUN apk add --no-cache \
     tar \
     xz \
     wget \
+    curl \
     su-exec \
     shadow \
     sqlite \
     ffmpeg \
     && rm -rf /var/cache/apk/*
+
+COPY src/server/ytdlp-release.json /tmp/ytdlp-release.json
+
+# Select the standalone musl binary for the image's architecture.
+RUN case "$(apk --print-arch)" in \
+        x86_64) asset=yt-dlp_musllinux ;; \
+        aarch64) asset=yt-dlp_musllinux_aarch64 ;; \
+        *) echo "Unsupported yt-dlp architecture" >&2; exit 1 ;; \
+    esac \
+    && version=$(node -p 'require("/tmp/ytdlp-release.json").version') \
+    && checksum=$(node -p 'require("/tmp/ytdlp-release.json").sha256[process.argv[1]]' "$asset") \
+    && curl -fL "https://github.com/yt-dlp/yt-dlp/releases/download/${version}/${asset}" -o /usr/local/bin/yt-dlp \
+    && echo "$checksum  /usr/local/bin/yt-dlp" | sha256sum -c - \
+    && chmod +x /usr/local/bin/yt-dlp
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -72,9 +88,10 @@ COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 COPY init-db.sql /app/init-db.sql
 
 # Create directories for data and downloads
-# Symlink system FFmpeg so the app finds it at expected location
-RUN mkdir -p /app/prisma/data /app/downloads /app/ffmpeg \
+# Symlink system FFmpeg and yt-dlp so the app finds them at expected locations
+RUN mkdir -p /app/prisma/data /app/downloads /app/ffmpeg /app/ytdlp \
     && ln -s /usr/bin/ffmpeg /app/ffmpeg/ffmpeg \
+    && ln -s /usr/local/bin/yt-dlp /app/ytdlp/yt-dlp \
     && chown -R nextjs:nodejs /app
 
 # Copy entrypoint script

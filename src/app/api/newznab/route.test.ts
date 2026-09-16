@@ -33,6 +33,14 @@ beforeEach(() => {
 });
 
 describe("Newznab indexer validation", () => {
+  it("routes t=movie text queries through provider-aware movie search", async () => {
+    mediathekMocks.fetchMovieSearchByQuery.mockResolvedValue(EMPTY_RSS);
+    const response = await GET(
+      new NextRequest("http://localhost/api/newznab/api?t=movie&q=Rundschau&limit=20&offset=5")
+    );
+    expect(mediathekMocks.fetchMovieSearchByQuery).toHaveBeenCalledWith("Rundschau", 20, 5);
+    expect(await response.text()).toBe(EMPTY_RSS);
+  });
   it("returns a movie-category result for the Radarr sync request", async () => {
     const response = await GET(
       new NextRequest(

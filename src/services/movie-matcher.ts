@@ -1,5 +1,11 @@
+import { isStreamingUrl } from "@/lib/stream-url";
 import type { ApiResultItem, TmdbMovieData } from "@/types";
 import { getSetting } from "@/lib/settings";
+
+async function isHlsEnabled(): Promise<boolean> {
+  const setting = await getSetting("download.enableHLS");
+  return setting === "true";
+}
 
 // Default duration tolerance in minutes
 const DEFAULT_DURATION_TOLERANCE = 10;
@@ -92,6 +98,7 @@ export async function matchMovieItems(
   minDurationSeconds: number
 ): Promise<MovieMatchResult[]> {
   const durationTolerance = await getDurationTolerance();
+  const hlsEnabled = await isHlsEnabled();
   const results: MovieMatchResult[] = [];
 
   const normalizedGermanTitle = normalizeTitle(movieData.germanTitle);
@@ -99,12 +106,18 @@ export async function matchMovieItems(
   const movieRuntimeMinutes = movieData.runtime || 0;
 
   console.log(
-    `[MovieMatcher] Matching ${items.length} items against "${movieData.germanTitle}" (original: "${movieData.title}"), runtime: ${movieRuntimeMinutes} min`
+    `[MovieMatcher] Matching ${items.length} items against "${movieData.germanTitle}" (original: "${movieData.title}"), runtime: ${movieRuntimeMinutes} min, hlsEnabled: ${hlsEnabled}`
   );
 
   for (const item of items) {
-    // Skip m3u8 streams
-    if (item.url_video.endsWith(".m3u8")) continue;
+    // Skip m3u8 streams unless HLS is enabled
+    if (
+      !hlsEnabled &&
+      ![item.url_video, item.url_video_low, item.url_video_hd].some(
+        (url) => url && !isStreamingUrl(url)
+      )
+    )
+      continue;
 
     const normalizedTopic = normalizeTitle(item.topic);
     const normalizedTitle = normalizeTitle(item.title);

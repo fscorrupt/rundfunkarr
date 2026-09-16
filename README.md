@@ -26,6 +26,23 @@ Rundfunk-Indexer für Sonarr/Radarr - Automatischer Download von ARD, ZDF und an
 - **Community-Rulesets** - Lokale Rulesets via Pull Request erweiterbar
 - **SQLite-Datenbank** - Persistente Speicherung von Cache und Download-Historie
 
+## SRF und ORF über HLS
+
+Aktiviere **HLS-Streams aktivieren** unter Settings → Streaming. Mit
+**ORF-Suche aktivieren** werden ORF-Treffer aus MediathekView einbezogen.
+Für die SRF-API trägst du Consumer Key und Consumer Secret aus dem
+[SRG-SSR-Entwicklerportal](https://developer.srgssr.ch/en/apis/srgssr-video) ein.
+Diese Quellen stehen der Websuche und Newznab einschließlich RSS-Sync zur Verfügung.
+Die vorhandenen Episodenregeln bestimmen weiterhin, welche Releases Sonarr erhält.
+
+SRF-Videoreferenzen werden erst beim Download durch yt-dlp aufgelöst, einschließlich
+der benötigten Stream-Tokens. Ein optionaler Proxy gilt für yt-dlp und Downloads,
+jedoch nicht für die SRG-SSR-Metadaten-API. Regionale Beschränkungen hängen weiterhin
+vom Proxy-Standort und der Verfügbarkeit beim Sender ab.
+Die MKV-Einstellung gilt auch für HLS: aktiviert ergibt MKV, deaktiviert MP4.
+Docker enthält eine feste yt-dlp-Version mit Prüfsummenprüfung. Native Installationen
+können einen eigenen Programmpfad oder den ebenfalls geprüften automatischen Download nutzen.
+
 ## Installation mit Docker
 
 ### docker-compose.yml
@@ -60,13 +77,13 @@ image: ghcr.io/rundfunkarr/rundfunkarr:nightly
 Für reproduzierbare Deployments kann statt `latest` auch eine feste Version verwendet werden:
 
 ```yaml
-image: ghcr.io/rundfunkarr/rundfunkarr:1.2.3
+image: ghcr.io/rundfunkarr/rundfunkarr:1.3.0
 ```
 
 Der Git-Tag-Alias mit `v`-Präfix ist ebenfalls verfügbar:
 
 ```bash
-docker pull ghcr.io/rundfunkarr/rundfunkarr:v1.2.3
+docker pull ghcr.io/rundfunkarr/rundfunkarr:v1.3.0
 ```
 
 ### Starten

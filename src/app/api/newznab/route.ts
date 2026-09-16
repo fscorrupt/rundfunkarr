@@ -118,8 +118,8 @@ export async function GET(request: NextRequest) {
 
       // Search by query string for movies
       if (q) {
-        console.log(`[Newznab] Movie search by query: ${q} - not implemented, returning empty`);
-        return new NextResponse(serializeRss(getEmptyRssResult()), {
+        const searchResults = await fetchMovieSearchByQuery(q, limit, offset);
+        return new NextResponse(searchResults, {
           status: 200,
           headers: { "Content-Type": "application/xml; charset=utf-8" },
         });

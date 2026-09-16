@@ -6,7 +6,7 @@ const { getMinDurationSeconds, getCategoriesForTopics } = vi.hoisted(() => ({
   getCategoriesForTopics: vi.fn(),
 }));
 
-vi.mock("@/lib/settings", () => ({ getMinDurationSeconds }));
+vi.mock("@/lib/settings", () => ({ getMinDurationSeconds, getSetting: vi.fn(async () => null) }));
 vi.mock("@/services/category", () => ({
   getCategoriesForTopics,
 }));
