@@ -425,9 +425,36 @@ export async function downloadVideo(
   });
 }
 
+// Parse a yt-dlp speed string (e.g. "10.50MiB/s") into bytes/sec.
+function parseYtdlpSpeed(speedStr: string): number {
+  const speedMatch = speedStr.match(/([\d.]+)(\w+)\/s/);
+  if (!speedMatch) return 0;
+  const value = parseFloat(speedMatch[1]);
+  const unit = speedMatch[2].toLowerCase();
+  if (unit.includes("g")) return value * 1024 * 1024 * 1024;
+  if (unit.includes("m")) return value * 1024 * 1024;
+  if (unit.includes("k")) return value * 1024;
+  return value;
+}
+
 /**
  * Download HLS stream to MKV file
- * Simplified wrapper for HLS downloads with progress tracking
+ *
+ * Downloads video and audio as two separate yt-dlp invocations and muxes
+ * them locally, rather than a single "bestvideo+bestaudio" yt-dlp call.
+ *
+ * Some HLS masters (observed on ORF's APA CDN, e.g. on.orf.at content)
+ * declare audio as a separate #EXT-X-MEDIA group rather than muxed into
+ * each video rendition. yt-dlp's format selector can't confirm from this
+ * manifest shape that the video-only renditions truly lack audio (it
+ * reports their acodec as unknown, not the literal "none"), so
+ * "bestvideo+bestaudio" silently resolves to just the video-only format
+ * instead of erroring or falling back - the merge is dropped, not
+ * attempted, and the resulting file has no audio track at all. Every
+ * individual format (video-only, audio-only) downloads correctly on its
+ * own though, so this sidesteps the broken "+" merge entirely by
+ * downloading each half separately and combining them with our own
+ * ffmpeg pass.
  */
 export async function downloadHlsStream(
   hlsUrl: string,
@@ -438,46 +465,105 @@ export async function downloadHlsStream(
     totalBytes: number,
     speed: number
   ) => Promise<void>,
-  container: "mkv" | "mp4" = "mkv",
+  // The output container is determined by outputPath's own extension (the
+  // caller already builds it with the right one) since the final merge
+  // writes straight to outputPath - kept for API compatibility with callers.
+  _container: "mkv" | "mp4" = "mkv",
   maxHeight?: 480 | 720 | 1080
 ): Promise<YtdlpDownloadResult> {
-  let lastPercent = 0;
+  const tempDir = path.dirname(outputPath);
+  const uid = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const videoTempPath = path.join(tempDir, `.hls-video-${uid}.mp4`);
+  const audioTempPath = path.join(tempDir, `.hls-audio-${uid}.mp4`);
+  // Tracks whatever the video/audio download actually produced, so the
+  // finally block below always cleans up the right path - including when
+  // downloadVideo/mergeVideoAudio reject before ever reporting a result
+  // (see the catch block).
+  let videoOutputPath = videoTempPath;
+  let audioOutputPath = audioTempPath;
 
-  return downloadVideo(hlsUrl, {
-    outputPath,
-    container,
-    format: maxHeight
-      ? `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]`
-      : "bestvideo+bestaudio/best",
-    onProgress: async (percent, speedStr) => {
-      if (onProgress && percent > lastPercent) {
-        lastPercent = percent;
+  let lastOverallPercent = 0;
+  const forwardProgress =
+    (base: number, span: number) => async (percent: number, speedStr: string) => {
+      if (!onProgress) return;
+      const overall = base + (percent / 100) * span;
+      if (overall <= lastOverallPercent) return;
+      lastOverallPercent = overall;
+      await onProgress(overall, 0, 0, parseYtdlpSpeed(speedStr));
+    };
 
-        // Parse speed string (e.g., "10.50MiB/s") to bytes/sec
-        let speedBytes = 0;
-        const speedMatch = speedStr.match(/([\d.]+)(\w+)\/s/);
-        if (speedMatch) {
-          const value = parseFloat(speedMatch[1]);
-          const unit = speedMatch[2].toLowerCase();
-          if (unit.includes("g")) {
-            speedBytes = value * 1024 * 1024 * 1024;
-          } else if (unit.includes("m")) {
-            speedBytes = value * 1024 * 1024;
-          } else if (unit.includes("k")) {
-            speedBytes = value * 1024;
-          } else {
-            speedBytes = value;
-          }
-        }
+  try {
+    const videoResult = await downloadVideo(hlsUrl, {
+      outputPath: videoTempPath,
+      container: "mp4",
+      format: maxHeight
+        ? `bestvideo[height<=${maxHeight}]/best[height<=${maxHeight}]`
+        : "bestvideo/best",
+      onProgress: forwardProgress(0, 85),
+    });
+    videoOutputPath = videoResult.outputPath ?? videoTempPath;
+    if (!videoResult.success) {
+      return videoResult;
+    }
 
-        // We don't have accurate total bytes for HLS, estimate based on progress
-        const estimatedTotal = 0; // Unknown for HLS
-        const estimatedDownloaded = 0;
+    const audioResult = await downloadVideo(hlsUrl, {
+      outputPath: audioTempPath,
+      container: "mp4",
+      // "/best" fallback: some HLS masters only expose combined
+      // #EXT-X-STREAM-INF variants with no separate audio-only format, so
+      // bare "bestaudio" would have no match there and error out.
+      // mergeVideoAudio only ever maps this input's audio stream, so it's
+      // safe to hand it a combined video+audio file here too.
+      format: maxHeight ? `bestaudio/best[height<=${maxHeight}]` : "bestaudio/best",
+      onProgress: forwardProgress(85, 10),
+    });
+    audioOutputPath = audioResult.outputPath ?? audioTempPath;
+    if (!audioResult.success) {
+      return audioResult;
+    }
 
-        await onProgress(percent, estimatedDownloaded, estimatedTotal, speedBytes);
-      }
-    },
-  });
+    const { mergeVideoAudio } = await import("./ffmpeg");
+    const mergeResult = await mergeVideoAudio(videoOutputPath, audioOutputPath, outputPath);
+    if (!mergeResult.success) {
+      await fs.unlink(outputPath).catch(() => {});
+      return { success: false, error: mergeResult.error };
+    }
+
+    if (onProgress) {
+      // The mux already succeeded and the final file is in place - a
+      // failure to report the closing 100% shouldn't turn an otherwise-
+      // complete download into a reported failure (the caller would then
+      // skip moving the finished file and mark a successful download as
+      // failed instead).
+      await onProgress(100, 0, 0, 0).catch((error) => {
+        console.error("[downloadHlsStream] Failed to report final progress:", error);
+      });
+    }
+
+    return { success: true, outputPath: mergeResult.outputPath };
+  } catch (error) {
+    // downloadVideo/mergeVideoAudio can reject before their own process
+    // handlers ever run (a bad proxy URL, a DB read failure fetching
+    // settings, fs.mkdir failing, ...) - catch that here so this function
+    // keeps its documented contract of always resolving, and so the
+    // finally block below still runs to clean up temp files either way.
+    console.error("[downloadHlsStream] Failed:", error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    // Failed yt-dlp downloads can leave .part, .ytdl and fragment files.
+    // Match this attempt's UID plus the extension separator so concurrent
+    // downloads and their sidecars remain untouched.
+    const prefixes = [`.hls-video-${uid}.`, `.hls-audio-${uid}.`];
+    const entries = await fs.readdir(tempDir).catch(() => [] as string[]);
+    const cleanupPaths = new Set([
+      videoOutputPath,
+      audioOutputPath,
+      ...entries
+        .filter((name) => prefixes.some((prefix) => name.startsWith(prefix)))
+        .map((name) => path.join(tempDir, name)),
+    ]);
+    await Promise.all([...cleanupPaths].map((file) => fs.unlink(file).catch(() => {})));
+  }
 }
 
 /**
